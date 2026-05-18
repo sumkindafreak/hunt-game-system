@@ -13,6 +13,12 @@ TYPE|key=value;key=value
 from microbit import *
 import radio
 import music
+try:
+    import microphone
+    HAS_MICROPHONE = True
+except:
+    microphone = None
+    HAS_MICROPHONE = False
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +46,13 @@ PROXIMITY_MEMORY_MS = 1500
 TAG_COOLDOWN_MS = 5000
 DISPLAY_FRAME_MS = 180
 REVIVE_FAIL_COOLDOWN_MS = 1200
+SENSOR_TX_INTERVAL_MS = 4000
+BRIGHTNESS_UPDATE_MS = 1200
+SHAKE_ALERT_COOLDOWN_MS = 5000
+LOGO_TOUCH_COOLDOWN_MS = 700
+LOUD_SOUND_THRESHOLD = 120
+LOUD_TAG_CONFIRM_FACTOR_PERCENT = 65
+COMBO_STATUS_COOLDOWN_MS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +82,8 @@ PLAYER_ELIMINATED = "PLAYER_ELIMINATED"
 HEARTBEAT = "HEARTBEAT"
 PING = "PING"
 ACK = "ACK"
+PLAYER_SENSOR = "PLAYER_SENSOR"
+PLAYER_ALERT = "PLAYER_ALERT"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +109,128 @@ def safe_int(value, default=0):
         return int(value)
     except:
         return default
+
+
+def detect_logo_touch_support():
+    try:
+        pin_logo  # noqa: F821 (exists on micro:bit v2)
+        return hasattr(pin_logo, "is_touched")
+    except:
+        return False
+
+
+def read_sound_level():
+    if not HAS_MICROPHONE:
+        return -1
+    try:
+        return int(microphone.sound_level())
+    except:
+        return -1
+
+
+def read_heading():
+    try:
+        if hasattr(compass, "is_calibrated") and (not compass.is_calibrated()):
+            return -1
+        return int(compass.heading())
+    except:
+        return -1
+
+
+def safe_set_brightness(level):
+    try:
+        display.set_brightness(level)
+    except:
+        pass
+
+
+def adapt_display_brightness(now):
+    global last_brightness_update_ms
+    if now - last_brightness_update_ms < BRIGHTNESS_UPDATE_MS:
+        return
+    last_brightness_update_ms = now
+
+    # Re-use LED matrix as ambient light sensor input.
+    light_raw = display.read_light_level()
+    mapped = 1 + int((light_raw * 8) / 255)
+    if mapped < 1:
+        mapped = 1
+    if mapped > 9:
+        mapped = 9
+    safe_set_brightness(mapped)
+
+
+def external_state_output(now):
+    """
+    Optional external pin outputs:
+    - pin1: analog state level for LED bars or recorder input.
+    - pin2: heartbeat pulse mirror while tagged/reviving.
+    """
+    level = 0
+    if state == WAITING:
+        level = 80
+    elif state == SURVIVOR:
+        level = 220
+    elif state == HUNTER:
+        level = 450
+    elif state == TAGGED:
+        level = 700
+    elif state == REVIVING:
+        level = 860
+    elif state == ELIMINATED:
+        level = 1023
+
+    try:
+        pin1.write_analog(level)
+    except:
+        pass
+
+    pulse_on = False
+    if state in (TAGGED, REVIVING):
+        if now - last_heartbeat_sound_ms < 100:
+            pulse_on = True
+    try:
+        pin2.write_digital(1 if pulse_on else 0)
+    except:
+        pass
+
+
+def send_sensor_packet():
+    ax = 0
+    ay = 0
+    az = 0
+    temp_c = 0
+    light = 0
+    try:
+        ax = accelerometer.get_x()
+        ay = accelerometer.get_y()
+        az = accelerometer.get_z()
+    except:
+        pass
+    try:
+        temp_c = temperature()
+    except:
+        temp_c = 0
+    try:
+        light = display.read_light_level()
+    except:
+        light = 0
+
+    send_packet(
+        PLAYER_SENSOR,
+        {
+            "p": PLAYER_ID,
+            "temp": temp_c,
+            "l": light,
+            "h": read_heading(),
+            "snd": last_sound_level,
+            "ax": ax,
+            "ay": ay,
+            "az": az,
+            "v2": int(HAS_MICROPHONE or HAS_LOGO_TOUCH),
+        },
+        include_common=False,
+    )
 
 
 def encode_packet(msg_type, fields):
@@ -137,7 +274,7 @@ def parse_packet(payload):
     return {"type": msg_type, "fields": fields}
 
 
-def send_packet(msg_type, extra_fields=None, dest=BROADCAST_ID):
+def send_packet(msg_type, extra_fields=None, dest=BROADCAST_ID, include_common=True):
     """Send a packet and include common fields automatically."""
     if extra_fields is None:
         extra_fields = {}
@@ -145,9 +282,10 @@ def send_packet(msg_type, extra_fields=None, dest=BROADCAST_ID):
     packet_fields = {
         "src": PLAYER_ID,
         "dst": dest,
-        "state": state,
-        "ms": running_time(),
     }
+    if include_common:
+        packet_fields["state"] = state
+        packet_fields["ms"] = running_time()
     for key in extra_fields:
         packet_fields[key] = extra_fields[key]
 
@@ -195,6 +333,26 @@ def tone(freq, duration_ms):
         pass
 
 
+def play_transition_sound(event_name):
+    """Short event cues to use the built-in speaker/buzzer."""
+    if event_name == "start":
+        tone(523, 90)
+    elif event_name == "hunter":
+        tone(190, 120)
+    elif event_name == "tagged":
+        tone(240, 140)
+    elif event_name == "revive_ok":
+        tone(523, 80)
+        sleep(20)
+        tone(659, 80)
+    elif event_name == "revive_fail":
+        tone(180, 110)
+    elif event_name == "eliminated":
+        tone(150, 220)
+    elif event_name == "alert":
+        tone(700, 60)
+
+
 def show_status_brief():
     """A+B: show player id and state abbreviation."""
     label = "?"
@@ -213,6 +371,20 @@ def show_status_brief():
     display.scroll("P{0} {1}".format(PLAYER_ID, label), delay=70)
 
 
+def toggle_ready_state():
+    global ready
+    if state != WAITING:
+        return
+    ready = not ready
+    if ready:
+        display.show(Image.YES)
+    else:
+        display.show(Image.NO)
+    send_packet(PLAYER_READY, {"player": PLAYER_ID, "ready": int(ready)})
+    send_status_snapshot()
+    debug("Ready toggled -> {0}".format(ready))
+
+
 def reset_for_lobby():
     """Return node to WAITING, used for power-on and BASE_RESET."""
     global game_running, state, ready
@@ -220,6 +392,7 @@ def reset_for_lobby():
     global fallback_window_start_ms, fallback_ping_count, fallback_strong_until_ms
     global last_strong_hunter_ms, last_tagged_change_ms, last_revive_fail_ms
     global last_heartbeat_sound_ms
+    global last_logo_touch_ms, last_shake_alert_ms, last_sensor_tx_ms, last_combo_status_ms
 
     game_running = False
     state = WAITING
@@ -234,6 +407,10 @@ def reset_for_lobby():
     last_tagged_change_ms = -TAG_COOLDOWN_MS
     last_revive_fail_ms = -REVIVE_FAIL_COOLDOWN_MS
     last_heartbeat_sound_ms = 0
+    last_logo_touch_ms = -LOGO_TOUCH_COOLDOWN_MS
+    last_shake_alert_ms = -SHAKE_ALERT_COOLDOWN_MS
+    last_sensor_tx_ms = 0
+    last_combo_status_ms = -COMBO_STATUS_COOLDOWN_MS
     debug("Reset to lobby")
 
 
@@ -251,6 +428,7 @@ def start_round():
     tagged_deadline_ms = 0
     revive_end_ms = 0
     proximity_confirm_start_ms = 0
+    play_transition_sound("start")
     debug("Round started as SURVIVOR")
 
 
@@ -260,6 +438,7 @@ def become_hunter():
         return
     state = HUNTER
     proximity_confirm_start_ms = 0
+    play_transition_sound("hunter")
     debug("State -> HUNTER")
 
 
@@ -283,6 +462,7 @@ def become_tagged(new_infection):
     if new_infection or tagged_deadline_ms <= now:
         tagged_deadline_ms = now + TAGGED_COUNTDOWN_MS
     if new_infection:
+        play_transition_sound("tagged")
         send_packet(PLAYER_TAGGED, {"player": PLAYER_ID, "remaining": tagged_deadline_ms - now})
     last_tagged_change_ms = now
     debug("State -> TAGGED (new={0})".format(new_infection))
@@ -304,6 +484,7 @@ def fail_revive():
     state = TAGGED
     revive_end_ms = 0
     last_revive_fail_ms = now
+    play_transition_sound("revive_fail")
     send_packet(PLAYER_REVIVE_FAIL, {"player": PLAYER_ID, "reason": "hunter_nearby"})
     debug("Revive failed (hunter nearby)")
 
@@ -314,6 +495,7 @@ def complete_revive():
     tagged_deadline_ms = 0
     revive_end_ms = 0
     last_tagged_change_ms = running_time()
+    play_transition_sound("revive_ok")
     send_packet(PLAYER_REVIVE_SUCCESS, {"player": PLAYER_ID})
     debug("Revive success -> SURVIVOR")
 
@@ -324,6 +506,7 @@ def eliminate():
         return
     state = ELIMINATED
     revive_end_ms = 0
+    play_transition_sound("eliminated")
     send_packet(PLAYER_ELIMINATED, {"player": PLAYER_ID})
     debug("State -> ELIMINATED")
 
@@ -426,12 +609,33 @@ def handle_incoming(packet, rssi):
 
 def send_status_snapshot():
     remaining = 0
+    temp_c = 0
+    light = 0
     if state in (TAGGED, REVIVING) and tagged_deadline_ms > 0:
         now = running_time()
         remaining = tagged_deadline_ms - now
         if remaining < 0:
             remaining = 0
-    send_packet(PLAYER_STATUS, {"player": PLAYER_ID, "ready": int(ready), "remaining": remaining})
+    try:
+        temp_c = temperature()
+    except:
+        temp_c = 0
+    try:
+        light = display.read_light_level()
+    except:
+        light = 0
+    send_packet(
+        PLAYER_STATUS,
+        {
+            "player": PLAYER_ID,
+            "ready": int(ready),
+            "remaining": remaining,
+            "temp": temp_c,
+            "light": light,
+            "snd": last_sound_level,
+            "head": read_heading(),
+        },
+    )
 
 
 def update_display(now):
@@ -466,6 +670,7 @@ def update_display(now):
 # Setup
 # ---------------------------------------------------------------------------
 HAS_RECEIVE_FULL = hasattr(radio, "receive_full")
+HAS_LOGO_TOUCH = detect_logo_touch_support()
 
 radio.on()
 radio.config(group=RADIO_GROUP, power=7, length=120, queue=25)
@@ -489,13 +694,25 @@ last_revive_fail_ms = -REVIVE_FAIL_COOLDOWN_MS
 last_hunter_ping_tx_ms = 0
 last_status_tx_ms = 0
 last_heartbeat_tx_ms = 0
+last_sensor_tx_ms = 0
 last_heartbeat_sound_ms = 0
 last_base_heartbeat_ms = 0
+last_brightness_update_ms = 0
+last_logo_touch_ms = -LOGO_TOUCH_COOLDOWN_MS
+last_shake_alert_ms = -SHAKE_ALERT_COOLDOWN_MS
+last_combo_status_ms = -COMBO_STATUS_COOLDOWN_MS
+last_sound_level = -1
 
 display_frame_idx = 0
 last_display_frame_ms = 0
 
-debug("Player node ready (RSSI support={0})".format(HAS_RECEIVE_FULL))
+debug(
+    "Player ready RSSI={0} logo={1} mic={2}".format(
+        HAS_RECEIVE_FULL,
+        HAS_LOGO_TOUCH,
+        HAS_MICROPHONE,
+    )
+)
 send_status_snapshot()
 
 
@@ -504,25 +721,69 @@ send_status_snapshot()
 # ---------------------------------------------------------------------------
 while True:
     now = running_time()
+    adapt_display_brightness(now)
+
+    latest_sound = read_sound_level()
+    if latest_sound >= 0:
+        last_sound_level = latest_sound
 
     # -------- Button controls --------
     if button_a.was_pressed() and state == WAITING:
-        ready = not ready
-        if ready:
-            display.show(Image.YES)
-        else:
-            display.show(Image.NO)
-        send_packet(PLAYER_READY, {"player": PLAYER_ID, "ready": int(ready)})
-        send_status_snapshot()
-        debug("Ready toggled -> {0}".format(ready))
+        toggle_ready_state()
 
     if button_b.was_pressed():
         # Medic action happens on the tagged player's node.
         if game_running and state == TAGGED and (now - last_revive_fail_ms > REVIVE_FAIL_COOLDOWN_MS):
             start_revive()
+        else:
+            show_status_brief()
 
-    if button_a.is_pressed() and button_b.is_pressed():
+    # micro:bit v2 logo touch adds an easy "glove-safe" control input.
+    if HAS_LOGO_TOUCH:
+        touched = False
+        try:
+            touched = pin_logo.is_touched()
+        except:
+            touched = False
+        if touched and (now - last_logo_touch_ms >= LOGO_TOUCH_COOLDOWN_MS):
+            last_logo_touch_ms = now
+            if state == WAITING and button_a.is_pressed():
+                try:
+                    display.scroll("CAL", delay=70)
+                    compass.calibrate()
+                    display.show(Image.YES)
+                except:
+                    display.show(Image.NO)
+            elif state == WAITING:
+                toggle_ready_state()
+            elif game_running and state == TAGGED and (now - last_revive_fail_ms > REVIVE_FAIL_COOLDOWN_MS):
+                start_revive()
+            else:
+                show_status_brief()
+
+    if button_a.is_pressed() and button_b.is_pressed() and (now - last_combo_status_ms >= COMBO_STATUS_COOLDOWN_MS):
+        last_combo_status_ms = now
         show_status_brief()
+
+    if accelerometer.was_gesture("shake") and (now - last_shake_alert_ms >= SHAKE_ALERT_COOLDOWN_MS):
+        last_shake_alert_ms = now
+        temp_now = 0
+        try:
+            temp_now = temperature()
+        except:
+            temp_now = 0
+        play_transition_sound("alert")
+        send_packet(
+            PLAYER_ALERT,
+            {
+                "player": PLAYER_ID,
+                "event": "shake",
+                "snd": last_sound_level,
+                "temp": temp_now,
+            },
+        )
+        send_status_snapshot()
+        debug("Shake alert broadcast")
 
     # -------- Receive all queued packets --------
     while True:
@@ -539,8 +800,14 @@ while True:
 
     # -------- Survivor gets tagged by sustained hunter proximity --------
     if game_running and state == SURVIVOR and proximity_confirm_start_ms > 0:
+        confirm_ms = TAG_CONFIRM_TIME_MS
+        # Optional v2 stealth rule: loud survivor gets tagged faster.
+        if HAS_MICROPHONE and (last_sound_level >= LOUD_SOUND_THRESHOLD):
+            confirm_ms = int((TAG_CONFIRM_TIME_MS * LOUD_TAG_CONFIRM_FACTOR_PERCENT) / 100)
+            if confirm_ms < 700:
+                confirm_ms = 700
         if hunter_nearby(now):
-            if now - proximity_confirm_start_ms >= TAG_CONFIRM_TIME_MS:
+            if now - proximity_confirm_start_ms >= confirm_ms:
                 become_tagged(True)
                 send_status_snapshot()
         else:
@@ -578,5 +845,10 @@ while True:
         send_packet(HEARTBEAT, {"player": PLAYER_ID, "ready": int(ready), "running": int(game_running)})
         last_heartbeat_tx_ms = now
 
+    if now - last_sensor_tx_ms >= SENSOR_TX_INTERVAL_MS:
+        send_sensor_packet()
+        last_sensor_tx_ms = now
+
+    external_state_output(now)
     update_display(now)
     sleep(40)

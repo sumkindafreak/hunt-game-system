@@ -7,6 +7,19 @@ Complete multi-node MicroPython game system for a physical chase/tag/medic game:
 
 This project is designed to be beginner-friendly, fully commented, and easy to expand.
 
+It now uses a broad set of micro:bit hardware features (v1 + v2 compatible with graceful fallback):
+
+- radio
+- LED matrix + light sensing
+- buttons A/B
+- accelerometer gestures
+- compass heading (when calibrated)
+- temperature sensor
+- speaker/buzzer audio cues
+- optional v2 logo touch
+- optional v2 microphone sound level
+- optional pin outputs (pin1 analog state + pin2 pulse mirror)
+
 ---
 
 ## 1) What HUNT does
@@ -99,6 +112,11 @@ You can tune the game by adjusting these values.
 - **Button A**: ready toggle (in `WAITING`)
 - **Button B**: medic revive attempt (when this node is `TAGGED`)
 - **A+B**: show player ID + current state
+- **Shake gesture**: broadcasts `PLAYER_ALERT` + sensor snapshot
+- **Logo touch (v2)**:
+  - tap in `WAITING`: ready toggle
+  - tap in `TAGGED`: revive attempt
+  - hold **A** while touching logo in `WAITING`: compass calibration
 
 ## Base node controls
 
@@ -107,6 +125,11 @@ You can tune the game by adjusting these values.
   - start game (if not running)
   - stop game (if running)
 - **A+B**: reset game and return all nodes to lobby
+- **Logo touch (v2)**:
+  - tap: cycle dashboard page (`0/1/2`)
+  - hold **A** while touching logo: compass calibration
+- **Shake gesture (running game)**: emergency stop
+- **Double clap (v2 microphone, lobby)**: hands-free game start
 
 ---
 
@@ -124,10 +147,12 @@ You can tune the game by adjusting these values.
 ## Base display
 
 Lobby:
-- alternates configured player count and ready count
+- alternates configured player count, ready count, and local/environment telemetry
 
 Running:
-- rotates summary views: `R`, survivor count, `H`, hunter count, eliminated count
+- dashboard page 0: core game counts (`R/H/E/T`)
+- dashboard page 1: tagged/reviving monitor + shortest bleed-out countdown digit
+- dashboard page 2: average temp/light/sound + base heading digit
 
 ---
 
@@ -155,6 +180,9 @@ Survivors listen for hunter pings and apply proximity logic:
 3. On confirm, survivor becomes `TAGGED`.
 
 Debounce/cooldown logic prevents immediate repeated re-tag loops.
+
+Optional v2 stealth behavior:
+- if microphone sound level is high while a survivor is near a hunter, tag confirm time is reduced (loud players are easier to detect).
 
 ---
 
@@ -199,6 +227,8 @@ Implemented packet types:
 - `PLAYER_REVIVE_SUCCESS`
 - `PLAYER_REVIVE_FAIL`
 - `PLAYER_ELIMINATED`
+- `PLAYER_SENSOR`
+- `PLAYER_ALERT`
 - `HEARTBEAT`
 - `PING`
 - `ACK`
@@ -235,6 +265,14 @@ This simple protocol is easy to bridge to:
    - V2 has built-in speaker.
    - Fallback pin0 buzzer support is included for external buzzers.
 
+5. **v2-only hardware features**
+   - `pin_logo` touch and `microphone.sound_level()` are v2 features.
+   - Code auto-detects support and safely disables those extras on v1.
+
+6. **Compass heading validity**
+   - Heading is useful only after calibration.
+   - Use logo-touch + button-A calibration shortcuts on compatible hardware.
+
 ---
 
 ## 14) Recommended tuning steps before a live game
@@ -262,7 +300,26 @@ This code is structured for expansion to:
 
 ---
 
-## 16) Quick checklist
+## 16) Full micro:bit functionality now used
+
+This build actively uses:
+
+- radio broadcast + packet parsing
+- LED matrix state rendering + animation frames
+- LED matrix ambient light sensing (`display.read_light_level`)
+- display auto-brightness control (`display.set_brightness`)
+- button events (`was_pressed`, `is_pressed`)
+- accelerometer gestures (`was_gesture("shake")`)
+- temperature telemetry (`temperature()`)
+- compass heading telemetry (`compass.heading`, when calibrated)
+- speaker/buzzer tones (`music.pitch`)
+- optional v2 logo touch input
+- optional v2 microphone level input
+- optional pin outputs for external indicators (`pin1`, `pin2`)
+
+---
+
+## 17) Quick checklist
 
 - [ ] All players flashed with `player_node.py`
 - [ ] Each player has unique `PLAYER_ID`
